@@ -3,12 +3,11 @@
  * This is an example router, you can delete this file and then update `../pages/api/trpc/[trpc].tsx`
  */
 import type { Post } from '@prisma/client';
-import { observable } from '@trpc/server/observable';
 import { EventEmitter } from 'events';
 import { prisma } from '../prisma';
-import { z } from 'zod';
 import { authedProcedure, publicProcedure, router } from '../trpc';
 import { on } from 'node:events';
+import typia, { tags } from 'typia';
 
 type EventMap<T> = Record<keyof T, any[]>;
 class IterableEventEmitter<T extends EventMap<T>> extends EventEmitter<T> {
@@ -17,6 +16,32 @@ class IterableEventEmitter<T extends EventMap<T>> extends EventEmitter<T> {
     opts?: NonNullable<Parameters<typeof on>[2]>,
   ): AsyncIterable<T[TEventName]> {
     return on(this as any, eventName, opts) as any;
+  }
+}
+
+interface IterableHelperProps<
+  E,
+  T extends EventMap<E>,
+  K extends keyof T & string,
+  R,
+> {
+  events: IterableEventEmitter<T>;
+  event: K;
+  signal?: AbortSignal;
+  onData: (data: T[K]) => R | undefined;
+}
+
+async function* iterableHelper<
+  E,
+  T extends EventMap<E>,
+  K extends keyof T & string,
+  R,
+>({ events, event, signal, onData }: IterableHelperProps<E, T, K, R>) {
+  for await (const data of events.toIterable(event, { signal })) {
+    const result = onData(data);
+    if (result !== undefined) {
+      yield result;
+    }
   }
 }
 
@@ -50,14 +75,29 @@ process.on('SIGTERM', () => {
   clearInterval(interval);
 });
 
+type ITestAdd = {
+  id?: string
+  text: string
+}
+
+const ITestAddValidator = typia.createAssert<ITestAdd>()
+
+type IIsTyping = {
+  typing: boolean
+}
+
+const IIsTypingValidator = typia.createAssert<IIsTyping>()
+
+type IInfinite = {
+  cursor?: Date | null
+  take?: (number & tags.Minimum<1> & tags.Maximum<50>) | null 
+}
+
+const IInfiniteValidator = typia.createAssert<IInfinite>()
+
 export const postRouter = router({
   add: authedProcedure
-    .input(
-      z.object({
-        id: z.string().uuid().optional(),
-        text: z.string().min(1),
-      }),
-    )
+    .input(ITestAddValidator)
     .mutation(async (opts) => {
       const { input, ctx } = opts;
       const { name } = ctx.user;
@@ -75,7 +115,7 @@ export const postRouter = router({
     }),
 
   isTyping: authedProcedure
-    .input(z.object({ typing: z.boolean() }))
+    .input(IIsTypingValidator)
     .mutation((opts) => {
       const { input, ctx } = opts;
       const { name } = ctx.user;
@@ -91,10 +131,7 @@ export const postRouter = router({
 
   infinite: publicProcedure
     .input(
-      z.object({
-        cursor: z.date().nullish(),
-        take: z.number().min(1).max(50).nullish(),
-      }),
+      IInfiniteValidator
     )
     .query(async (opts) => {
       const { input } = opts;
@@ -122,33 +159,21 @@ export const postRouter = router({
       };
     }),
 
-  onAdd: publicProcedure.subscription(() => {
-    return observable<Post>((emit) => {
-      const onAdd = (data: Post) => {
-        emit.next(data);
-      };
-      ee.on('add', onAdd);
-      return () => {
-        ee.off('add', onAdd);
-      };
+  onAdd: publicProcedure.subscription((opts) => {
+    return iterableHelper({
+      events: ee,
+      event: 'add',
+      signal: opts.signal,
+      onData: ([data]) => data,
     });
   }),
 
-  whoIsTyping: publicProcedure.subscription(() => {
-    let prev: string[] | null = null;
-    return observable<string[]>((emit) => {
-      const onIsTypingUpdate = () => {
-        const newData = Object.keys(currentlyTyping);
-
-        if (!prev || prev.toString() !== newData.toString()) {
-          emit.next(newData);
-        }
-        prev = newData;
-      };
-      ee.on('isTypingUpdate', onIsTypingUpdate);
-      return () => {
-        ee.off('isTypingUpdate', onIsTypingUpdate);
-      };
+  whoIsTyping: publicProcedure.subscription((opts) => {
+    return iterableHelper({
+      events: ee,
+      event: 'isTypingUpdate',
+      signal: opts.signal,
+      onData: () => Object.keys(currentlyTyping),
     });
   }),
 });
